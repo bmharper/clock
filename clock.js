@@ -19,26 +19,26 @@
   let announcementTimer;
   let activeDrag = null;
 
-  // The seven segments are vector shapes, so no font or network is needed.
+  // Every LED uses the same 22 × 6 hexagon, rotated for vertical bars.
+  // Symmetric placement leaves a visible gap at every joint, including the middle.
+  const segmentShape = [[-11, 0], [-8, -3], [8, -3], [11, 0], [8, 3], [-8, 3]];
   const segments = [
-    '5,2 25,2 29,6 25,10 5,10 1,6',
-    '26,11 30,7 30,29 26,33 22,29 22,15',
-    '26,35 30,39 30,61 26,57 22,53 22,39',
-    '5,58 25,58 29,62 25,66 5,66 1,62',
-    '4,35 8,39 8,53 4,57 0,61 0,39',
-    '4,11 8,15 8,29 4,33 0,29 0,7',
-    '5,30 25,30 29,34 25,38 5,38 1,34'
-  ];
+    [15, 6, false], [27, 20, true], [27, 48, true],
+    [15, 62, false], [3, 48, true], [3, 20, true], [15, 34, false]
+  ].map(([cx, cy, vertical]) => segmentShape.map(([x, y]) =>
+    `${cx + (vertical ? -y : x)},${cy + (vertical ? x : y)}`
+  ).join(' '));
   const digitSegments = ['abcdef', 'bc', 'abdeg', 'abcdg', 'bcfg', 'acdfg', 'acdefg', 'abc', 'abcdefg', 'abcdfg'];
-  function numberSVG(value) {
-    const digits = pad(value).split('').map((digit, index) =>
-      `<g transform="translate(${index * 38 + 3} 0)">${segments.map((points, segment) =>
+  function numberSVG(value, leadingZero = true) {
+    const digits = String(value).padStart(2, leadingZero ? '0' : ' ').split('').map((digit, index) =>
+      digit === ' ' ? '' : `<g transform="translate(${index * 38 + 3} 0)">${segments.map((points, segment) =>
         `<polygon class="segment ${digitSegments[Number(digit)].includes('abcdefg'[segment]) ? 'on' : 'off'}" points="${points}"/>`
       ).join('')}</g>`
     ).join('');
     return `<svg viewBox="0 0 74 68" fill="currentColor" focusable="false">${digits}</svg>`;
   }
   const numberCache = Array.from({ length: 60 }, (_, value) => numberSVG(value));
+  const hour12Cache = Array.from({ length: 13 }, (_, value) => numberSVG(value, false));
 
   // Hour markers and minute ticks share the hands' exact center.
   $('markers').innerHTML = Array.from({ length: 60 }, (_, index) => {
@@ -69,14 +69,42 @@
     const rgb = (hex) => [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16));
     return `rgb(${rgb(a).map((value, index) => Math.round(value + (rgb(b)[index] - value) * amount)).join(', ')})`;
   }
+  function luminance(color) {
+    const rgb = color.startsWith('#')
+      ? [1, 3, 5].map((offset) => parseInt(color.slice(offset, offset + 2), 16))
+      : color.match(/[\d.]+/g).map(Number);
+    return rgb.reduce((sum, value, index) => {
+      const channel = value / 255;
+      return sum + (channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4) * [.2126, .7152, .0722][index];
+    }, 0);
+  }
+  function readableInk(preferred, background) {
+    const light = luminance(background);
+    const ink = luminance(preferred);
+    const contrast = (Math.max(light, ink) + .05) / (Math.min(light, ink) + .05);
+    // Cross-fading dark daytime ink into luminous night ink makes it disappear
+    // against the dimming face around 18:20. Keep a contrasting foreground
+    // during that crossover; the cases and room still dim continuously.
+    if (contrast >= 4.5) return preferred;
+    return (light + .05) / .05 >= 1.05 / (light + .05) ? '#000000' : '#ffffff';
+  }
   const smooth = (x) => x * x * (3 - 2 * x);
-  let lastLight = '';
   function renderLighting(hour) {
     // Dawn: 05:00–08:00. Dusk: 17:00–20:00. No daylight after 20:00.
     const sunlight = hour < 5 || hour >= 20 ? 0
       : hour < 8 ? smooth((hour - 5) / 3)
       : hour < 17 ? 1 : 1 - smooth((hour - 17) / 3);
-    for (const key of Object.keys(dayColors)) root.style.setProperty(`--${key}`, mix(nightColors[key], dayColors[key], sunlight));
+    const colors = Object.fromEntries(Object.keys(dayColors).map((key) => [key, mix(nightColors[key], dayColors[key], sunlight)]));
+    for (const [ink, background] of [['digits', 'lcd'], ['digits24', 'lcd24'], ['dial-ink', 'dial'], ['ink', 'room'], ['muted', 'room']]) {
+      colors[ink] = readableInk(colors[ink], colors[background]);
+    }
+    for (const [key, color] of Object.entries(colors)) root.style.setProperty(`--${key}`, color);
+    // Reflections can wash out pale ink during dusk; show them only over dark ink.
+    for (const [reflection, ink, background] of [
+      ['screen-reflection', 'digits', 'lcd'], ['reflection24', 'digits24', 'lcd24'], ['dial-reflection', 'dial-ink', 'dial']
+    ]) {
+      root.style.setProperty(`--${reflection}`, luminance(colors[ink]) < luminance(colors[background]) ? sunlight : 0);
+    }
     root.style.setProperty('--sun', sunlight);
     root.style.setProperty('--night', 1 - sunlight);
     root.style.setProperty('--lume-glow', `rgba(141, 255, 185, ${(1 - sunlight) * .65})`);
@@ -84,14 +112,6 @@
     root.style.setProperty('--glow24', `rgba(135, 255, 206, ${(1 - sunlight) * .4})`);
     root.style.colorScheme = sunlight < .3 ? 'dark' : 'light';
     document.querySelector('meta[name="theme-color"]').content = mix(nightColors.room, dayColors.room, sunlight);
-    const label = sunlight === 0 ? 'Night glow' : hour < 8 ? 'Morning light' : hour >= 17 ? 'Evening light' : 'Daylight';
-    if (label !== lastLight) {
-      $('light-label').textContent = label;
-      $('light-icon').innerHTML = sunlight === 0
-        ? '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z"/>'
-        : '<circle cx="12" cy="12" r="4"/><path d="M12 1v3m0 16v3M1 12h3m16 0h3M4.2 4.2l2.1 2.1m11.4 11.4 2.1 2.1M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>';
-      lastLight = label;
-    }
   }
   function displayValue(wheel, delta = 0) {
     if (wheel.dataset.unit === 'minutes') return wrap(Math.floor(time / 60) + delta, 60);
@@ -112,7 +132,8 @@
     if (Math.floor(time / 60) === lastMinute && !force) return;
     lastMinute = Math.floor(time / 60);
     wheels.forEach((wheel) => {
-      wheel.querySelector('.reel').innerHTML = [-1, 0, 1].map((delta) => numberCache[displayValue(wheel, delta)]).join('');
+      const cache = wheel.dataset.unit === 'hours' && wheel.dataset.format === '12' ? hour12Cache : numberCache;
+      wheel.querySelector('.reel').innerHTML = [-1, 0, 1].map((delta) => cache[displayValue(wheel, delta)]).join('');
       wheel.setAttribute('aria-valuenow', displayValue(wheel));
       wheel.setAttribute('aria-valuetext', `${displayValue(wheel)} ${wheel.dataset.unit}${wheel.dataset.unit === 'hours' && wheel.dataset.format === '12' ? (hours < 12 ? ' AM' : ' PM') : ''}`);
     });
@@ -121,7 +142,10 @@
     $('am').setAttribute('aria-pressed', hours < 12);
     $('pm').setAttribute('aria-pressed', hours >= 12);
     $('analog').setAttribute('aria-label', `Analog clock: ${hours % 12 || 12}:${pad(minutes)} ${period}`);
-    renderLighting(hours + minutes / 60);
+    // Lighting changes restyle the whole scene. Defer them while dragging so
+    // pointer moves only update the clock readouts and hands.
+    if (activeDrag) activeDrag.lightingPending = true;
+    else renderLighting(hours + minutes / 60);
   }
   function announce() {
     clearTimeout(announcementTimer);
@@ -144,10 +168,11 @@
 
   function finishDrag() {
     if (!activeDrag) return;
-    const { wheel, pointerId } = activeDrag;
+    const { wheel, pointerId, lightingPending } = activeDrag;
     activeDrag = null;
     wheel.querySelector('.reel').style.transform = '';
     if (wheel.hasPointerCapture(pointerId)) wheel.releasePointerCapture(pointerId);
+    if (lightingPending) renderLighting(Math.floor(time / 60) / 60);
   }
   wheels.forEach((wheel) => {
     const reel = wheel.querySelector('.reel');
@@ -157,18 +182,24 @@
       if (!event.isPrimary || event.button !== 0 || activeDrag) return;
       wheel.focus({ preventScroll: true });
       wheel.setPointerCapture(event.pointerId);
-      activeDrag = { wheel, pointerId: event.pointerId, y: event.clientY, remainder: 0 };
+      activeDrag = {
+        wheel, pointerId: event.pointerId, startY: event.clientY, steps: 0,
+        stepSize: Math.max(18, Math.min(32, wheel.clientHeight * .3))
+      };
     });
     wheel.addEventListener('pointermove', (event) => {
       if (!activeDrag || activeDrag.wheel !== wheel || activeDrag.pointerId !== event.pointerId) return;
       const drag = activeDrag;
-      drag.remainder += drag.y - event.clientY;
-      drag.y = event.clientY;
-      const stepSize = Math.max(18, wheel.clientHeight * .38);
-      const steps = Math.trunc(drag.remainder / stepSize);
-      if (steps) { adjust(wheel.dataset.unit, steps); drag.remainder -= steps * stepSize; }
-      // Reveal the next/previous number as the finger turns the virtual wheel.
-      reel.style.transform = `translateY(${-drag.remainder / stepSize * wheel.clientHeight}px)`;
+      const position = (drag.startY - event.clientY) / drag.stepSize;
+      const steps = Math.sign(position) * Math.round(Math.abs(position));
+      // Commit the nearest visible digit while the pointer is still down.
+      // Use the gesture's total displacement so reversing direction immediately
+      // restores the matching time on both digital clocks and the analog face.
+      if (steps !== drag.steps) {
+        adjust(wheel.dataset.unit, steps - drag.steps);
+        drag.steps = steps;
+      }
+      reel.style.transform = `translateY(${-(position - steps) * wheel.clientHeight}px)`;
     });
     ['pointerup', 'pointercancel', 'lostpointercapture'].forEach((type) => {
       wheel.addEventListener(type, (event) => {
